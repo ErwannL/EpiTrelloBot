@@ -248,33 +248,33 @@ async def help_command(ctx, *, topic: str = None):
 
 @bot.command(name="next")
 async def next_events(ctx):
-    """Affiche les 3 prochains événements planifiés."""
-    # ✅ Création du fichier s’il n’existe pas
-    if not os.path.exists("events.json"):
-        with open("events.json", "w") as f:
-            json.dump([], f)
+    """Affiche les 3 prochains événements planifiés sur Discord."""
+    guild = ctx.guild
+    events = await guild.fetch_scheduled_events()
 
-    with open("events.json", "r") as f:
-        events = json.load(f)
+    # Garder uniquement ceux à venir
+    now = datetime.now(timezone.utc)
+    upcoming = [
+        e for e in events
+        if e.status == discord.EventStatus.scheduled and get_event_start_time(e) > now
+    ]
 
-    now = datetime.now(pytz.utc)
-    upcoming = []
-
-    for e in events:
-        start = datetime.fromisoformat(e["start_time"])
-        if start > now:
-            upcoming.append(e)
-
-    upcoming = sorted(upcoming, key=lambda x: x["start_time"])[:3]
+    # Trier et prendre les 3 prochains
+    upcoming = sorted(upcoming, key=lambda e: get_event_start_time(e))[:3]
 
     if not upcoming:
         await ctx.send("📭 Aucun événement à venir.")
         return
 
-    msg = "**🗓️ Prochains événements :**\n"
+    msg = "**🗓️ Prochains événements Discord :**\n"
     for e in upcoming:
-        date_str = datetime.fromisoformat(e["start_time"]).strftime("%d/%m/%Y %H:%M")
-        msg += f"• **{e['title']}** — {date_str} | [Lien]({e['link']})\n"
+        start_time = get_event_start_time(e)
+        if start_time:
+            date_str = start_time.astimezone(pytz.timezone("Europe/Paris")).strftime("%d/%m/%Y %H:%M")
+        else:
+            date_str = "Heure inconnue"
+        link = f"https://discord.com/events/{guild.id}/{e.id}"
+        msg += f"• **{e.name}** — {date_str} | [Lien]({link})\n"
 
     await ctx.send(msg)
 
