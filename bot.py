@@ -33,6 +33,16 @@ def github_headers():
     return headers
 
 
+def get_event_start_time(event):
+    """Return a datetime for the event start, handling attribute name differences across discord.py versions."""
+    # discord.py renamed/changed scheduled event attributes across versions
+    for attr in ("scheduled_start_time", "start_time", "scheduled_start_at"):
+        val = getattr(event, attr, None)
+        if val is not None:
+            return val
+    return None
+
+
 # ============ 🚀 ÉVÉNEMENTS ============
 @bot.event
 async def on_ready():
@@ -54,7 +64,19 @@ async def on_thread_create(thread: discord.Thread):
     pr_number = match.group(1)
     pr_url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_number}"
 
-    response = requests.get(pr_url, headers=github_headers())
+    headers = {
+        "Accept": "application/vnd.github+json",
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
+    try:
+        response = requests.get(pr_url, headers=headers, timeout=10)
+    except requests.RequestException as exc:
+        print(f"GitHub API request failed for PR {pr_number}: {exc}")
+        await thread.send("⚠️ Erreur lors de la requête vers GitHub pour vérifier la PR. Réessaie plus tard.")
+        return
+
     print(f"GitHub API status: {response.status_code}")
 
     if response.status_code == 200:
@@ -65,7 +87,6 @@ async def on_thread_create(thread: discord.Thread):
         await thread.send(f"❌ La PR #{pr_number} n’existe pas ou est privée.")
     else:
         await thread.send(f"⚠️ Erreur inattendue ({response.status_code}) depuis GitHub.")
-
 
 # ============ 💬 COMMANDES ============
 @bot.command()
@@ -78,7 +99,13 @@ async def repo(ctx):
 async def pr(ctx, number: int):
     """Affiche une Pull Request"""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{number}"
-    r = requests.get(url, headers=github_headers())
+    try:
+        r = requests.get(url, headers=github_headers(), timeout=10)
+    except requests.RequestException as exc:
+        print(f"GitHub PR request failed: {exc}")
+        await ctx.send("⚠️ Erreur lors de la requête vers GitHub. Réessaie plus tard.")
+        return
+
     if r.status_code == 200:
         data = r.json()
         embed = discord.Embed(
@@ -98,7 +125,13 @@ async def pr(ctx, number: int):
 async def issue(ctx, number: int):
     """Affiche une issue GitHub"""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/issues/{number}"
-    r = requests.get(url, headers=github_headers())
+    try:
+        r = requests.get(url, headers=github_headers(), timeout=10)
+    except requests.RequestException as exc:
+        print(f"GitHub issue request failed: {exc}")
+        await ctx.send("⚠️ Erreur lors de la requête vers GitHub. Réessaie plus tard.")
+        return
+
     if r.status_code == 200:
         data = r.json()
         embed = discord.Embed(
@@ -117,10 +150,24 @@ async def issue(ctx, number: int):
 @bot.command()
 async def kanban(ctx):
     """Renvoie le lien du tableau GitHub Projects"""
-    if GITHUB_PROJECT:
-        await ctx.send(f"🗂️ Kanban : {GITHUB_PROJECT}")
-    else:
+    if not GITHUB_PROJECT:
         await ctx.send("⚠️ Aucun lien Kanban configuré.")
+        return
+
+    # Accept either a full URL or a path like 'users/antoinefld/projects/3' or 'owner/repo/projects/3'
+    if isinstance(GITHUB_PROJECT, str) and GITHUB_PROJECT.startswith("http"):
+        url = GITHUB_PROJECT
+    else:
+        url = f"https://github.com/{GITHUB_PROJECT}"
+
+    try:
+        await ctx.send(f"🗂️ Kanban : {url}")
+    except discord.HTTPException as exc:
+        print(f"Failed to send kanban link: {exc}")
+        try:
+            await ctx.author.send(f"Je n'ai pas pu envoyer le lien du Kanban dans le canal. Voici le lien : {url}")
+        except Exception:
+            print("Also failed to DM the user the kanban link.")
 
 
 @bot.command()
@@ -203,13 +250,22 @@ async def next(ctx):
     now = datetime.now(timezone.utc)
     events_list = []
     
-    for event in await ctx.guild.fetch_scheduled_events():
-        if event.status == discord.EntityStatus.scheduled and event.scheduled_start_time:
-            delta = (event.scheduled_start_time - now).total_seconds()
+    try:
+        fetched = await ctx.guild.fetch_scheduled_events()
+    except Exception as exc:
+        print(f"Failed to fetch scheduled events: {exc}")
+        await ctx.send("⚠️ Impossible de récupérer les événements planifiés.")
+        return
+
+    for event in fetched:
+        start_time = get_event_start_time(event)
+        if event.status == discord.EventStatus.scheduled and start_time:
+            delta = (start_time - now).total_seconds()
             if delta > 0:
                 events_list.append(event)
 
-    events_list.sort(key=lambda e: e.scheduled_start_time)
+    # Trier en sécurité en utilisant get_event_start_time
+    events_list.sort(key=lambda e: get_event_start_time(e) or datetime.max)
     upcoming = events_list[:3]
 
     if not upcoming:
@@ -218,10 +274,11 @@ async def next(ctx):
 
     embed = discord.Embed(title="📅 Prochains événements", color=0x7289DA)
     for event in upcoming:
-        time_local = event.scheduled_start_time.astimezone()
+        st = get_event_start_time(event)
+        time_local = st.astimezone() if st else None
         embed.add_field(
             name=event.name,
-            value=f"🕒 {time_local.strftime('%d/%m/%Y %H:%M')} | [Lien]({event.url})",
+            value=f"🕒 {time_local.strftime('%d/%m/%Y %H:%M')} | [Lien]({event.url})" if time_local else f"[Lien]({event.url})",
             inline=False
         )
     await ctx.send(embed=embed)
@@ -250,12 +307,11 @@ async def check_meetings():
     for guild in bot.guilds:
         events = await guild.fetch_scheduled_events()
         for event in events:
-            if event.status != discord.EntityStatus.scheduled:
+            if event.status != discord.EventStatus.scheduled:
                 continue
-            if event.scheduled_start_time is None:
+            start_time = get_event_start_time(event)
+            if start_time is None:
                 continue
-
-            start_time = event.scheduled_start_time
             delta = (start_time - now).total_seconds()
 
             # Si l’événement commence dans 5 minutes ou moins
@@ -299,3 +355,7 @@ async def check_meetings():
 
                 # Évite le spam toutes les minutes
                 await asyncio.sleep(65)
+
+
+if __name__ == "__main__":
+    bot.run(TOKEN)
