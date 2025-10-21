@@ -7,6 +7,8 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 import asyncio
+import json
+import pytz
 
 # ============ 🔧 CONFIGURATION ============
 load_dotenv()
@@ -244,58 +246,71 @@ async def help_command(ctx, *, topic: str = None):
     await ctx.send("⚠️ Commande ou catégorie introuvable. Tapez !help pour la liste des commandes.")
 
 
-@bot.command()
-async def next(ctx):
-    """Affiche les 3 prochains événements planifiés"""
-    now = datetime.now(timezone.utc)
-    events_list = []
-    
-    try:
-        fetched = await ctx.guild.fetch_scheduled_events()
-    except Exception as exc:
-        print(f"Failed to fetch scheduled events: {exc}")
-        await ctx.send("⚠️ Impossible de récupérer les événements planifiés.")
-        return
+@bot.command(name="next")
+async def next_events(ctx):
+    """Affiche les 3 prochains événements planifiés."""
+    with open("events.json", "r") as f:
+        events = json.load(f)
 
-    for event in fetched:
-        start_time = get_event_start_time(event)
-        if event.status == discord.EventStatus.scheduled and start_time:
-            delta = (start_time - now).total_seconds()
-            if delta > 0:
-                events_list.append(event)
+    now = datetime.now(pytz.utc)
+    upcoming = []
 
-    # Trier en sécurité en utilisant get_event_start_time
-    events_list.sort(key=lambda e: get_event_start_time(e) or datetime.max)
-    upcoming = events_list[:3]
+    for e in events:
+        start = datetime.fromisoformat(e["start_time"])
+        if start > now:
+            upcoming.append(e)
+
+    upcoming = sorted(upcoming, key=lambda x: x["start_time"])[:3]
 
     if not upcoming:
-        await ctx.send("📭 Aucun événement planifié prochainement.")
+        await ctx.send("📭 Aucun événement à venir.")
         return
 
-    embed = discord.Embed(title="📅 Prochains événements", color=0x7289DA)
-    for event in upcoming:
-        st = get_event_start_time(event)
-        time_local = st.astimezone() if st else None
-        embed.add_field(
-            name=event.name,
-            value=f"🕒 {time_local.strftime('%d/%m/%Y %H:%M')} | [Lien]({event.url})" if time_local else f"[Lien]({event.url})",
-            inline=False
-        )
-    await ctx.send(embed=embed)
+    msg = "**🗓️ Prochains événements :**\n"
+    for e in upcoming:
+        date_str = datetime.fromisoformat(e["start_time"]).strftime("%d/%m/%Y %H:%M")
+        msg += f"• **{e['title']}** — {date_str} | [Lien]({e['link']})\n"
+
+    await ctx.send(msg)
 
 
-@bot.command()
-async def notify(ctx, option: str):
-    """Permet de s'inscrire ou se désinscrire des rappels d'événements"""
+@bot.command(name="notify")
+async def notify(ctx, option: str = None):
+    """Permet de s'inscrire ou se désinscrire des rappels d'événements."""
     user_id = ctx.author.id
-    option = option.lower()
 
-    if option == "off":
-        notify_opt_out.add(user_id)
-        await ctx.send(f"🔕 {ctx.author.mention}, vous ne recevrez plus les rappels d’événements.")
-    elif option == "on":
-        notify_opt_out.discard(user_id)
-        await ctx.send(f"🔔 {ctx.author.mention}, vous recevrez à nouveau les rappels d’événements.")
+    # Charger la liste des utilisateurs abonnés
+    with open("notified_users.json", "r") as f:
+        notified_users = json.load(f)
+
+    # Si aucun argument n'est fourni → afficher le statut actuel
+    if option is None:
+        if user_id in notified_users:
+            await ctx.send(f"🔔 {ctx.author.mention}, tu es **actuellement inscrit** aux rappels.")
+        else:
+            await ctx.send(f"🔕 {ctx.author.mention}, tu n’es **pas inscrit** aux rappels.")
+        return
+
+    # Activation
+    if option.lower() == "on":
+        if user_id in notified_users:
+            await ctx.send(f"✅ {ctx.author.mention}, tu es **déjà inscrit** aux rappels.")
+        else:
+            notified_users.append(user_id)
+            with open("notified_users.json", "w") as f:
+                json.dump(notified_users, f)
+            await ctx.send(f"🔔 {ctx.author.mention}, tu es **inscrit** aux rappels.")
+
+    # Désactivation
+    elif option.lower() == "off":
+        if user_id in notified_users:
+            notified_users.remove(user_id)
+            with open("notified_users.json", "w") as f:
+                json.dump(notified_users, f)
+            await ctx.send(f"❌ {ctx.author.mention}, tu es **désinscrit** des rappels.")
+        else:
+            await ctx.send(f"ℹ️ {ctx.author.mention}, tu n’étais **pas inscrit**.")
+
     else:
         await ctx.send("⚠️ Utilisation : `!notify on` ou `!notify off`")
 
