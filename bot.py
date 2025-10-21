@@ -248,35 +248,44 @@ async def help_command(ctx, *, topic: str = None):
 
 @bot.command(name="next")
 async def next_events(ctx):
-    """Affiche les 3 prochains événements planifiés sur Discord."""
+    """Affiche les 3 prochains événements planifiés sur Discord, en simulant les récurrences."""
+    searching_msg = await ctx.send("🔍 Je cherche les prochains événements…")
+
     guild = ctx.guild
     events = await guild.fetch_scheduled_events()
-
-    # Garder uniquement ceux à venir
     now = datetime.now(timezone.utc)
-    upcoming = [
-        e for e in events
-        if e.status == discord.EventStatus.scheduled and get_event_start_time(e) > now
-    ]
+    upcoming = []
 
-    # Trier et prendre les 3 prochains
-    upcoming = sorted(upcoming, key=lambda e: get_event_start_time(e))[:3]
+    for e in events:
+        start_time = get_event_start_time(e)
+        if not start_time or e.status != discord.EventStatus.scheduled:
+            continue
+
+        # Ajouter l'événement actuel s'il est à venir
+        if start_time > now:
+            upcoming.append((e.name, start_time, e.id, guild.id))
+
+        # Détecter les événements récurrents (exemple: Weekly)
+        if "weekly" in e.name.lower():
+            # Générer les 3 prochaines occurrences (hebdomadaire)
+            for i in range(1, 4):
+                future_start = start_time + timedelta(weeks=i)
+                upcoming.append((e.name, future_start, e.id, guild.id))
+
+    # Trier et garder les 3 prochains
+    upcoming = sorted(upcoming, key=lambda x: x[1])[:3]
 
     if not upcoming:
-        await ctx.send("📭 Aucun événement à venir.")
+        await searching_msg.edit(content="📭 Aucun événement à venir.")
         return
 
     msg = "**🗓️ Prochains événements Discord :**\n"
-    for e in upcoming:
-        start_time = get_event_start_time(e)
-        if start_time:
-            date_str = start_time.astimezone(pytz.timezone("Europe/Paris")).strftime("%d/%m/%Y %H:%M")
-        else:
-            date_str = "Heure inconnue"
-        link = f"https://discord.com/events/{guild.id}/{e.id}"
-        msg += f"• **{e.name}** — {date_str} | [Lien]({link})\n"
+    for name, start_time, event_id, guild_id in upcoming:
+        date_str = start_time.astimezone(pytz.timezone("Europe/Paris")).strftime("%d/%m/%Y %H:%M")
+        link = f"https://discord.com/events/{guild_id}/{event_id}"
+        msg += f"• **{name}** — {date_str} | [Lien]({link})\n"
 
-    await ctx.send(msg)
+    await searching_msg.edit(content=msg)
 
 
 @bot.command(name="notify")
