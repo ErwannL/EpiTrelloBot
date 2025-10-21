@@ -249,6 +249,11 @@ async def help_command(ctx, *, topic: str = None):
 @bot.command(name="next")
 async def next_events(ctx):
     """Affiche les 3 prochains événements planifiés."""
+    # ✅ Création du fichier s’il n’existe pas
+    if not os.path.exists("events.json"):
+        with open("events.json", "w") as f:
+            json.dump([], f)
+
     with open("events.json", "r") as f:
         events = json.load(f)
 
@@ -279,11 +284,15 @@ async def notify(ctx, option: str = None):
     """Permet de s'inscrire ou se désinscrire des rappels d'événements."""
     user_id = ctx.author.id
 
-    # Charger la liste des utilisateurs abonnés
+    # ✅ Création du fichier s’il n’existe pas
+    if not os.path.exists("notified_users.json"):
+        with open("notified_users.json", "w") as f:
+            json.dump([], f)
+
     with open("notified_users.json", "r") as f:
         notified_users = json.load(f)
 
-    # Si aucun argument n'est fourni → afficher le statut actuel
+    # ✅ Cas 1 : !notify seul → affiche le statut
     if option is None:
         if user_id in notified_users:
             await ctx.send(f"🔔 {ctx.author.mention}, tu es **actuellement inscrit** aux rappels.")
@@ -291,7 +300,7 @@ async def notify(ctx, option: str = None):
             await ctx.send(f"🔕 {ctx.author.mention}, tu n’es **pas inscrit** aux rappels.")
         return
 
-    # Activation
+    # ✅ Cas 2 : !notify on → inscription
     if option.lower() == "on":
         if user_id in notified_users:
             await ctx.send(f"✅ {ctx.author.mention}, tu es **déjà inscrit** aux rappels.")
@@ -299,20 +308,22 @@ async def notify(ctx, option: str = None):
             notified_users.append(user_id)
             with open("notified_users.json", "w") as f:
                 json.dump(notified_users, f)
-            await ctx.send(f"🔔 {ctx.author.mention}, tu es **inscrit** aux rappels.")
+            await ctx.send(f"🔔 {ctx.author.mention}, tu es maintenant **inscrit** aux rappels.")
+        return
 
-    # Désactivation
-    elif option.lower() == "off":
+    # ✅ Cas 3 : !notify off → désinscription
+    if option.lower() == "off":
         if user_id in notified_users:
             notified_users.remove(user_id)
             with open("notified_users.json", "w") as f:
                 json.dump(notified_users, f)
-            await ctx.send(f"❌ {ctx.author.mention}, tu es **désinscrit** des rappels.")
+            await ctx.send(f"❌ {ctx.author.mention}, tu es maintenant **désinscrit** des rappels.")
         else:
-            await ctx.send(f"ℹ️ {ctx.author.mention}, tu n’étais **pas inscrit**.")
+            await ctx.send(f"ℹ️ {ctx.author.mention}, tu n’étais pas inscrit.")
+        return
 
-    else:
-        await ctx.send("⚠️ Utilisation : `!notify on` ou `!notify off`")
+    # ✅ Cas 4 : Mauvaise syntaxe
+    await ctx.send("⚠️ Utilisation : `!notify`, `!notify on` ou `!notify off`")
 
 # ============ 🕒 RAPPPELS AUTOMATIQUES DES ÉVÉNEMENTS DISCORD ============
 @tasks.loop(minutes=1)
