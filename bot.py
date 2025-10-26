@@ -10,6 +10,26 @@ import asyncio
 import json
 import pytz
 
+
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "✅ Bot en ligne."
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+
+
+
 # ============ 🔧 CONFIGURATION ============
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -482,4 +502,5 @@ async def close_thread(ctx):
 
 
 if __name__ == "__main__":
+    keep_alive()
     bot.run(TOKEN)
