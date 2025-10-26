@@ -50,7 +50,47 @@ def get_event_start_time(event):
 async def on_ready():
     print(f"✅ Connecté en tant que {bot.user}")
     check_meetings.start()
+    await check_old_closed_threads()
 
+async def check_old_closed_threads():
+    """Parcourt tous les threads fermés mais non archivés pour planifier leur archivage."""
+    print("🔍 Vérification des anciens posts fermés...")
+    now = datetime.now(timezone.utc)
+
+    for guild in bot.guilds:
+        for channel in guild.channels:
+            # On ne s’intéresse qu’aux forums
+            if isinstance(channel, discord.ForumChannel):
+                try:
+                    threads = channel.threads
+                    if not threads:
+                        continue
+
+                    for thread in threads:
+                        # Ignorer ceux déjà archivés
+                        if thread.archived:
+                            continue
+
+                        # Si fermé, planifier l’archivage
+                        if thread.locked:
+                            # Discord ne donne pas directement la date de fermeture, donc on suppose "fermé récemment"
+                            print(f"🧵 Thread fermé détecté : {thread.name}")
+                            await thread.send("📦 Ce post est déjà fermé — il sera archivé automatiquement dans 24 heures.")
+                            await asyncio.create_task(schedule_archive(thread))
+                except Exception as e:
+                    print(f"⚠️ Erreur lors de la vérification du forum {channel.name}: {e}")
+
+async def schedule_archive(thread: discord.Thread):
+    """Programme l’archivage d’un thread 24h après sa fermeture."""
+    try:
+        await asyncio.sleep(86400)  # 24 heures
+        refreshed = await thread.guild.fetch_channel(thread.id)
+        if not refreshed.archived:
+            await refreshed.edit(archived=True)
+            await refreshed.send("📦 Ce post a été **archivé automatiquement** après 24 heures.")
+            print(f"✅ Post '{refreshed.name}' archivé automatiquement après 24h.")
+    except Exception as e:
+        print(f"⚠️ Erreur dans schedule_archive : {e}")
 
 @bot.event
 async def on_thread_create(thread: discord.Thread):
@@ -390,6 +430,55 @@ async def check_meetings():
 
                 # Évite le spam toutes les minutes
                 await asyncio.sleep(65)
+
+# ============ 🧵 FERMETURE ET ARCHIVAGE AUTOMATIQUE DES POSTS ============
+
+@bot.event
+async def on_thread_update(before: discord.Thread, after: discord.Thread):
+    """Détecte quand un post est fermé puis l’archive 24h plus tard."""
+    try:
+        # Vérifie que le thread vient d’être fermé
+        if before.locked is False and after.locked is True:
+            print(f"🧵 Le post '{after.name}' a été fermé. Archivage prévu dans 24h.")
+            await after.send("🔒 Ce post a été **fermé**. Il sera archivé automatiquement dans 24 heures.")
+            await asyncio.sleep(86400)  # 24 heures
+            # Vérifie que le post n’a pas été rouvert entre temps
+            refreshed = await after.guild.fetch_channel(after.id)
+            if not refreshed.archived:
+                await refreshed.edit(archived=True)
+                await refreshed.send("📦 Ce post a été **archivé automatiquement** après 24 heures.")
+                print(f"✅ Post '{after.name}' archivé automatiquement après 24h.")
+    except Exception as e:
+        print(f"⚠️ Erreur lors de l’archivage automatique du post : {e}")
+
+
+@bot.command(name="close")
+async def close_thread(ctx):
+    """Ferme le post/forum actuel et programme son archivage automatique dans 24h."""
+    thread = ctx.channel
+
+    if not isinstance(thread, discord.Thread):
+        await ctx.send("⚠️ Cette commande ne peut être utilisée **que dans un post de forum**.")
+        return
+
+    # Vérifie si le thread est déjà fermé
+    if thread.locked:
+        await ctx.send("🔒 Ce post est **déjà fermé**.")
+        return
+
+    try:
+        await thread.edit(locked=True)
+        await ctx.send("✅ Ce post a été **fermé**. Il sera archivé automatiquement dans 24 heures.")
+        print(f"🧵 Post '{thread.name}' fermé manuellement par {ctx.author}. Archivage dans 24h.")
+        await asyncio.sleep(86400)
+        refreshed = await thread.guild.fetch_channel(thread.id)
+        if not refreshed.archived:
+            await refreshed.edit(archived=True)
+            await refreshed.send("📦 Ce post a été **archivé automatiquement** après 24 heures.")
+            print(f"✅ Post '{thread.name}' archivé automatiquement après 24h.")
+    except Exception as e:
+        await ctx.send("⚠️ Impossible de fermer ou archiver ce post.")
+        print(f"Erreur lors de la fermeture manuelle du post : {e}")
 
 
 if __name__ == "__main__":
