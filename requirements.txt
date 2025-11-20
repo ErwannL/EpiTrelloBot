@@ -1,5 +1,5 @@
 
-discord.py
+discord.py>=2.2.0
 python-dotenv
 requests
 pytz

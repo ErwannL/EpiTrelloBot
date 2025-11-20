@@ -255,11 +255,160 @@ def get_reminder_channel(guild: discord.Guild, event):
 
     return None
 
+async def fetch_all_threads(channel: discord.ForumChannel):
+    """Récupère tous les threads d'un ForumChannel.
+
+    Essaie d'utiliser l'API client (channel.fetch_threads) si disponible.
+    Sinon, utilise l'API REST via requests et le token BOT (global TOKEN) pour récupérer
+    active + archived (public/private) threads. Retourne une liste d'objets avec
+    attributs utilisés ailleurs (id, name, archived, locked, created_at, message_count, parent).
+    """
+    threads = []
+
+    # 1) If the library provides channel.fetch_threads, use it (async)
+    fetch_attr = getattr(channel, 'fetch_threads', None)
+    if callable(fetch_attr):
+        try:
+            fetched = await channel.fetch_threads(limit=100)
+            threads.extend(fetched.threads)
+            while getattr(fetched, 'has_more', False):
+                fetched = await channel.fetch_threads(after=fetched.threads[-1].id)
+                threads.extend(fetched.threads)
+            return threads
+        except Exception:
+            # fall through to HTTP fallback
+            pass
+
+    # 2) HTTP fallback using the REST endpoints (requires TOKEN)
+    if not TOKEN:
+        return threads
+
+    def _snowflake_time(sid: int):
+        try:
+            sid = int(sid)
+            ts = ((sid >> 22) + 1420070400000) / 1000
+            return datetime.fromtimestamp(ts, timezone.utc)
+        except Exception:
+            return None
+
+    headers = {
+        "Authorization": f"Bot {TOKEN}",
+        "Accept": "application/json",
+        "User-Agent": "EpiTrelloBot (fetch_threads fallback)"
+    }
+
+    base = "https://discord.com/api/v10"
+
+    # Helper to convert REST thread dict -> SimpleNamespace-like object
+    def _mk_thread_obj(tdata):
+        tid = int(tdata.get('id'))
+        # Normalize archived/locked which can be bool or strings in some responses
+        def _to_bool(val):
+            if isinstance(val, bool):
+                return val
+            if val is None:
+                return False
+            s = str(val).lower()
+            return s in ('1', 'true', 'yes')
+
+        # Prefer thread_metadata if present (REST thread objects nest archived/locked there)
+        meta = tdata.get('thread_metadata') or tdata.get('metadata') or {}
+        archived_val = meta.get('archived', tdata.get('archived', False))
+        locked_val = meta.get('locked', tdata.get('locked', False))
+        archived = _to_bool(archived_val)
+        locked = _to_bool(locked_val)
+
+        # message_count may be absent
+        msg_count = tdata.get('message_count') if 'message_count' in tdata else '?'
+
+        return SimpleNamespace(
+            id=tid,
+            name=tdata.get('name') or f"<{tid}>",
+            archived=archived,
+            locked=locked,
+            created_at=_snowflake_time(tdata.get('id')),
+            message_count=msg_count,
+            parent=channel
+        )
+
+    try:
+        # Active threads
+        url_active = f"{base}/channels/{channel.id}/threads/active"
+        r = requests.get(url_active, headers=headers, timeout=10)
+        if r.status_code == 200:
+            j = r.json()
+            for td in j.get('threads', []):
+                threads.append(_mk_thread_obj(td))
+
+        # Archived public threads (paginated)
+        url_archived_public = f"{base}/channels/{channel.id}/threads/archived/public"
+        params = {'limit': 100}
+        while True:
+            r = requests.get(url_archived_public, headers=headers, params=params, timeout=10)
+            if r.status_code != 200:
+                break
+            j = r.json()
+            for td in j.get('threads', []):
+                threads.append(_mk_thread_obj(td))
+            if not j.get('has_more'):
+                break
+            # use 'before' param with last thread id to paginate
+            last = j.get('threads', [])[-1].get('id') if j.get('threads') else None
+            if not last:
+                break
+            params['before'] = last
+
+        # Archived private threads (if bot has access)
+        url_archived_private = f"{base}/channels/{channel.id}/threads/archived/private"
+        params = {'limit': 100}
+        while True:
+            r = requests.get(url_archived_private, headers=headers, params=params, timeout=10)
+            if r.status_code != 200:
+                break
+            j = r.json()
+            for td in j.get('threads', []):
+                threads.append(_mk_thread_obj(td))
+            if not j.get('has_more'):
+                break
+            last = j.get('threads', [])[-1].get('id') if j.get('threads') else None
+            if not last:
+                break
+            params['before'] = last
+
+    except Exception:
+        return threads
+
+    # Deduplicate by id
+    # Prefer non-archived thread objects when a thread appears both in active and archived results
+    unique = {}
+    for t in threads:
+        existing = unique.get(t.id)
+        if existing is None:
+            unique[t.id] = t
+            continue
+
+        # If existing is archived but new one is not, prefer the new one
+        existing_arch = getattr(existing, 'archived', False)
+        new_arch = getattr(t, 'archived', False)
+        if existing_arch and not new_arch:
+            unique[t.id] = t
+            continue
+
+        # If both have same archived state, prefer the one with a created_at value
+        if existing_arch == new_arch:
+            if getattr(existing, 'created_at', None) is None and getattr(t, 'created_at', None) is not None:
+                unique[t.id] = t
+            # otherwise keep existing (it may already be the active representation)
+
+    return list(unique.values())
+
+
 # ============ 🚀 ÉVÉNEMENTS ============
 
 @bot.event
 async def on_ready():
-    print(f"✅ Connecté en tant que {bot.user}")
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[RELOAD] {now} — ✅ Connecté en tant que {bot.user}")
     check_meetings.start()
     await check_old_closed_threads()
 
@@ -660,7 +809,7 @@ async def admin_error(ctx, error):
         await ctx.send(f"⚠️ Erreur: {error}")
 
 
-# ============ 🔎 COMMANDES ADMIN: VOICE / EVENT / SIMULATE ============
+# ============ 🔎 COMMANDES ADMIN: VOICE / EVENT / SIMULATE / DEBUG THREADS ============
 
 @admin.command(name="voice")
 @commands.has_permissions(administrator=True)
@@ -1062,6 +1211,138 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
         print(f"⚠️ Erreur lors de l’archivage automatique du post : {e}")
 
 # ========== To fix ===========
+
+@admin.command(name="debugthreads")
+@commands.has_permissions(administrator=True)
+async def admin_debugthreads(ctx, thread_id: int = None):
+    """Debug les threads fermés non archivés. Usage: !admin debugthreads [thread_id]"""
+    guild = ctx.guild
+    found = []
+    for channel in guild.channels:
+        if isinstance(channel, discord.ForumChannel):
+            try:
+                fetched_threads = await fetch_all_threads(channel)
+                for thread in fetched_threads:
+                    if thread.locked and not thread.archived:
+                        found.append(thread)
+            except Exception as e:
+                await ctx.send(f"⚠️ Erreur forum {getattr(channel,'name',channel.id)}: {e}")
+    if not found:
+        await ctx.send("✅ Aucun thread fermé non archivé trouvé.")
+        return
+    # Supprime les doublons (parfois un thread peut apparaître dans les deux listes)
+    found = {t.id: t for t in found}.values()
+    lines = [f"🧵 Threads fermés non archivés ({len(found)}):"]
+    for t in list(found)[:20]:
+        lines.append(f"• {t.name} (id:{t.id}) | locked:{t.locked} | archived:{t.archived} | créé:{t.created_at.strftime('%d/%m/%Y %H:%M') if t.created_at else '?'} | messages:{getattr(t,'message_count', '?')}")
+    await ctx.send("\n".join(lines))
+    if thread_id:
+        # Tenter d'archiver le thread donné
+        target = next((th for th in found if th.id == thread_id), None)
+        if not target:
+            await ctx.send(f"❌ Thread id {thread_id} non trouvé parmi les threads fermés non archivés.")
+            return
+        try:
+            await target.edit(archived=True)
+            await target.send("📦 Ce post a été archivé manuellement via debug.")
+            await ctx.send(f"✅ Thread '{target.name}' archivé manuellement.")
+        except Exception as e:
+            await ctx.send(f"⚠️ Erreur lors de l'archivage manuel: {e}")
+
+
+@admin.command(name="listthreads")
+@commands.has_permissions(administrator=True)
+async def admin_listthreads(ctx):
+    """Liste tous les posts de chaque forum, groupés par statut (ouvert, fermé, archivé)."""
+    guild = ctx.guild
+    all_threads = []
+    # Collect threads from every ForumChannel (fetch to include closed/archived)
+    for channel in guild.channels:
+        if isinstance(channel, discord.ForumChannel):
+            try:
+                fetched = await fetch_all_threads(channel)
+            except Exception as e:
+                await ctx.send(f"⚠️ Erreur forum {getattr(channel,'name',channel.id)}: {e}")
+                continue
+            for t in fetched:
+                # ensure parent is set for context
+                if not getattr(t, 'parent', None):
+                    t.parent = channel
+                all_threads.append(t)
+
+    if not all_threads:
+        return await ctx.send("Aucun post trouvé sur ce serveur.")
+
+    # Deduplicate by id
+    uniq = {t.id: t for t in all_threads}
+    threads_list = list(uniq.values())
+
+    # Sort by creation date if available (newest last)
+    def _key_created(th):
+        dt = getattr(th, 'created_at', None)
+        if dt is None:
+            return 0
+        try:
+            return dt.timestamp()
+        except Exception:
+            return 0
+
+    threads_list.sort(key=_key_created)
+
+    # Keep closed threads behavior (locked & not archived) as in debugthreads, and also list open threads
+    # Step 1: Put all threads into the 'Fermés' section (user request)
+    closed_threads = threads_list
+    open_threads = []
+
+    lines = []
+    # Closed section will contain all threads; remove forum segment per user request
+    lines.append(f"🧵 Fermés ({len(closed_threads)}):")
+    for t in closed_threads:
+        created = t.created_at.strftime('%d/%m/%Y %H:%M') if getattr(t, 'created_at', None) else '?'
+        # Format: name — id — créé (no forum part)
+        lines.append(f"• {t.name} — id:{t.id} — créé:{created}")
+
+    msg = "\n".join(lines)
+    # send in chunks to avoid message length limits
+    for chunk in [msg[i:i+1800] for i in range(0, len(msg), 1800)]:
+        await ctx.send(chunk)
+
+@admin.command(name="openthreads")
+@commands.has_permissions(administrator=True)
+async def admin_openthreads(ctx):
+    """Liste uniquement les posts ouverts (non fermés ET non archivés)."""
+    guild = ctx.guild
+    open_threads = []
+
+    for channel in guild.channels:
+        if isinstance(channel, discord.ForumChannel):
+            try:
+                # Threads actifs dans le cache
+                for t in channel.threads:
+                    if not getattr(t, 'locked', False) and not getattr(t, 'archived', False):
+                        if not getattr(t, 'parent', None):
+                            t.parent = channel
+                        open_threads.append(t)
+            except Exception as e:
+                await ctx.send(f"⚠️ Erreur forum {channel.name}: {e}")
+                continue
+
+    if not open_threads:
+        return await ctx.send("🔓 Aucun post ouvert trouvé sur ce serveur.")
+
+    # Tri par date
+    open_threads.sort(key=lambda t: t.created_at or 0)
+
+    # Message
+    lines = [f"🔓 Posts ouverts ({len(open_threads)}):"]
+    for t in open_threads:
+        created = t.created_at.strftime('%d/%m/%Y %H:%M') if t.created_at else '?'
+        forum_name = getattr(t.parent, 'name', 'unknown')
+        lines.append(f"• {t.name} — id:{t.id} — forum:{forum_name} — créé:{created}")
+
+    msg = "\n".join(lines)
+    for chunk in [msg[i:i+1800] for i in range(0, len(msg), 1800)]:
+        await ctx.send(chunk)
 
 async def check_old_closed_threads():
     """Parcourt tous les threads fermés mais non archivés pour planifier leur archivage."""
