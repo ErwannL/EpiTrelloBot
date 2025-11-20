@@ -1,7 +1,6 @@
 
 # =========== 📦 IMPORTS ============
 
-
 import re
 import os
 import requests
@@ -18,7 +17,6 @@ import logging
 # Configure basic logging so we reliably see runtime messages
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('EpiTrelloBot')
-
 
 # ============ 🔧 CONFIGURATION ============
 
@@ -1092,6 +1090,156 @@ async def admin_remind(ctx, event_id: int):
 
 # ============ 🕒 RAPPPELS AUTOMATIQUES DES ÉVÉNEMENTS DISCORD ============
 
+
+# ============ 🧵 FERMETURE ET ARCHIVAGE AUTOMATIQUE DES POSTS ============
+
+@admin.command(name="debugthreads")
+@commands.has_permissions(administrator=True)
+async def admin_debugthreads(ctx):
+    """Debug les threads fermés non archivés. Usage: !admin debugthreads"""
+    guild = ctx.guild
+    all_threads = []
+    # Collect threads from every ForumChannel (fetch to include closed/archived)
+    for channel in guild.channels:
+        if isinstance(channel, discord.ForumChannel):
+            try:
+                fetched = await fetch_all_threads(channel)
+            except Exception as e:
+                await ctx.send(f"⚠️ Erreur forum {getattr(channel,'name',channel.id)}: {e}")
+                continue
+            for t in fetched:
+                # ensure parent is set for context
+                if not getattr(t, 'parent', None):
+                    t.parent = channel
+                all_threads.append(t)
+
+    if not all_threads:
+        return await ctx.send("Aucun post trouvé sur ce serveur.")
+
+    # Deduplicate by id
+    uniq = {t.id: t for t in all_threads}
+    threads_list = list(uniq.values())
+
+    # Sort by creation date if available (newest last)
+    def _key_created(th):
+        dt = getattr(th, 'created_at', None)
+        if dt is None:
+            return 0
+        try:
+            return dt.timestamp()
+        except Exception:
+            return 0
+
+    threads_list.sort(key=_key_created)
+
+    # Keep closed threads behavior (locked & not archived) as in debugthreads, and also list open threads
+    # Step 1: Put all threads into the 'Fermés' section (user request)
+    closed_threads = threads_list
+    open_threads = []
+
+    lines = []
+    # Closed section will contain all threads; remove forum segment per user request
+    lines.append(f"🧵 Fermés ({len(closed_threads)}):")
+    for t in closed_threads:
+        created = t.created_at.strftime('%d/%m/%Y %H:%M') if getattr(t, 'created_at', None) else '?'
+        # Format: name — id — créé (no forum part)
+        lines.append(f"• {t.name} — id:{t.id} — créé:{created}")
+
+    msg = "\n".join(lines)
+    # send in chunks to avoid message length limits
+    for chunk in [msg[i:i+1800] for i in range(0, len(msg), 1800)]:
+        await ctx.send(chunk)
+
+@admin.command(name="openthreads")
+@commands.has_permissions(administrator=True)
+async def admin_openthreads(ctx):
+    """Liste uniquement les posts ouverts (non fermés ET non archivés)."""
+    guild = ctx.guild
+    open_threads = []
+
+    for channel in guild.channels:
+        if isinstance(channel, discord.ForumChannel):
+            try:
+                # Threads actifs dans le cache
+                for t in channel.threads:
+                    if not getattr(t, 'locked', False) and not getattr(t, 'archived', False):
+                        if not getattr(t, 'parent', None):
+                            t.parent = channel
+                        open_threads.append(t)
+            except Exception as e:
+                await ctx.send(f"⚠️ Erreur forum {channel.name}: {e}")
+                continue
+
+    if not open_threads:
+        return await ctx.send("🔓 Aucun post ouvert trouvé sur ce serveur.")
+
+    # Tri par date
+    open_threads.sort(key=lambda t: t.created_at or 0)
+
+    # Message
+    lines = [f"🔓 Posts ouverts ({len(open_threads)}):"]
+    for t in open_threads:
+        created = t.created_at.strftime('%d/%m/%Y %H:%M') if t.created_at else '?'
+        forum_name = getattr(t.parent, 'name', 'unknown')
+        lines.append(f"• {t.name} — id:{t.id} — forum:{forum_name} — créé:{created}")
+
+    msg = "\n".join(lines)
+    for chunk in [msg[i:i+1800] for i in range(0, len(msg), 1800)]:
+        await ctx.send(chunk)
+
+@admin.command(name="listthreads")
+@commands.has_permissions(administrator=True)
+async def admin_listthreads(ctx):
+    """Liste tous les posts de chaque forum, groupés par statut (ouvert, fermé)."""
+    # Reuse existing admin commands to ensure identical output and formatting.
+    # User requested: first show open threads, then closed threads.
+    await admin_openthreads(ctx)
+    await admin_debugthreads(ctx)
+
+
+# ========== To fix ===========
+
+async def check_old_closed_threads():
+    """Parcourt tous les threads fermés mais non archivés pour planifier leur archivage."""
+    print("🔍 Vérification des anciens posts fermés...")
+    now = datetime.now(timezone.utc)
+
+    for guild in bot.guilds:
+        for channel in guild.channels:
+            # On ne s’intéresse qu’aux forums
+            if isinstance(channel, discord.ForumChannel):
+                try:
+                    threads = channel.threads
+                    if not threads:
+                        continue
+
+                    for thread in threads:
+                        # Ignorer ceux déjà archivés
+                        if thread.archived:
+                            continue
+
+                        # Si fermé, planifier l’archivage
+                        if thread.locked:
+                            # Discord ne donne pas directement la date de fermeture, donc on suppose "fermé récemment"
+                            print(f"🧵 Thread fermé détecté : {thread.name}")
+                            await thread.send("📦 Ce post est déjà fermé — il sera archivé automatiquement dans 24 heures.")
+                            await asyncio.create_task(schedule_archive(thread))
+                except Exception as e:
+                    print(f"⚠️ Erreur lors de la vérification du forum {channel.name}: {e}")
+
+async def schedule_archive(thread: discord.Thread):
+    """Programme l’archivage d’un thread 24h après sa fermeture."""
+    try:
+        await asyncio.sleep(86400)  # 24 heures
+        refreshed = await thread.guild.fetch_channel(thread.id)
+        if not refreshed.archived:
+            await refreshed.edit(archived=True)
+            await refreshed.send("📦 Ce post a été **archivé automatiquement** après 24 heures.")
+            print(f"✅ Post '{refreshed.name}' archivé automatiquement après 24h.")
+    except Exception as e:
+        print(f"⚠️ Erreur dans schedule_archive : {e}")
+
+
 @tasks.loop(minutes=1)
 async def check_meetings():
     """Vérifie les événements Discord planifiés et envoie un rappel 5 min avant aux intéressés non connectés"""
@@ -1190,8 +1338,6 @@ async def check_meetings():
                 # Évite le spam toutes les minutes
                 await asyncio.sleep(65)
 
-# ============ 🧵 FERMETURE ET ARCHIVAGE AUTOMATIQUE DES POSTS ============
-
 @bot.event
 async def on_thread_update(before: discord.Thread, after: discord.Thread):
     """Détecte quand un post est fermé puis l’archive 24h plus tard."""
@@ -1210,179 +1356,6 @@ async def on_thread_update(before: discord.Thread, after: discord.Thread):
     except Exception as e:
         print(f"⚠️ Erreur lors de l’archivage automatique du post : {e}")
 
-# ========== To fix ===========
-
-@admin.command(name="debugthreads")
-@commands.has_permissions(administrator=True)
-async def admin_debugthreads(ctx, thread_id: int = None):
-    """Debug les threads fermés non archivés. Usage: !admin debugthreads [thread_id]"""
-    guild = ctx.guild
-    found = []
-    for channel in guild.channels:
-        if isinstance(channel, discord.ForumChannel):
-            try:
-                fetched_threads = await fetch_all_threads(channel)
-                for thread in fetched_threads:
-                    if thread.locked and not thread.archived:
-                        found.append(thread)
-            except Exception as e:
-                await ctx.send(f"⚠️ Erreur forum {getattr(channel,'name',channel.id)}: {e}")
-    if not found:
-        await ctx.send("✅ Aucun thread fermé non archivé trouvé.")
-        return
-    # Supprime les doublons (parfois un thread peut apparaître dans les deux listes)
-    found = {t.id: t for t in found}.values()
-    lines = [f"🧵 Threads fermés non archivés ({len(found)}):"]
-    for t in list(found)[:20]:
-        lines.append(f"• {t.name} (id:{t.id}) | locked:{t.locked} | archived:{t.archived} | créé:{t.created_at.strftime('%d/%m/%Y %H:%M') if t.created_at else '?'} | messages:{getattr(t,'message_count', '?')}")
-    await ctx.send("\n".join(lines))
-    if thread_id:
-        # Tenter d'archiver le thread donné
-        target = next((th for th in found if th.id == thread_id), None)
-        if not target:
-            await ctx.send(f"❌ Thread id {thread_id} non trouvé parmi les threads fermés non archivés.")
-            return
-        try:
-            await target.edit(archived=True)
-            await target.send("📦 Ce post a été archivé manuellement via debug.")
-            await ctx.send(f"✅ Thread '{target.name}' archivé manuellement.")
-        except Exception as e:
-            await ctx.send(f"⚠️ Erreur lors de l'archivage manuel: {e}")
-
-
-@admin.command(name="listthreads")
-@commands.has_permissions(administrator=True)
-async def admin_listthreads(ctx):
-    """Liste tous les posts de chaque forum, groupés par statut (ouvert, fermé, archivé)."""
-    guild = ctx.guild
-    all_threads = []
-    # Collect threads from every ForumChannel (fetch to include closed/archived)
-    for channel in guild.channels:
-        if isinstance(channel, discord.ForumChannel):
-            try:
-                fetched = await fetch_all_threads(channel)
-            except Exception as e:
-                await ctx.send(f"⚠️ Erreur forum {getattr(channel,'name',channel.id)}: {e}")
-                continue
-            for t in fetched:
-                # ensure parent is set for context
-                if not getattr(t, 'parent', None):
-                    t.parent = channel
-                all_threads.append(t)
-
-    if not all_threads:
-        return await ctx.send("Aucun post trouvé sur ce serveur.")
-
-    # Deduplicate by id
-    uniq = {t.id: t for t in all_threads}
-    threads_list = list(uniq.values())
-
-    # Sort by creation date if available (newest last)
-    def _key_created(th):
-        dt = getattr(th, 'created_at', None)
-        if dt is None:
-            return 0
-        try:
-            return dt.timestamp()
-        except Exception:
-            return 0
-
-    threads_list.sort(key=_key_created)
-
-    # Keep closed threads behavior (locked & not archived) as in debugthreads, and also list open threads
-    # Step 1: Put all threads into the 'Fermés' section (user request)
-    closed_threads = threads_list
-    open_threads = []
-
-    lines = []
-    # Closed section will contain all threads; remove forum segment per user request
-    lines.append(f"🧵 Fermés ({len(closed_threads)}):")
-    for t in closed_threads:
-        created = t.created_at.strftime('%d/%m/%Y %H:%M') if getattr(t, 'created_at', None) else '?'
-        # Format: name — id — créé (no forum part)
-        lines.append(f"• {t.name} — id:{t.id} — créé:{created}")
-
-    msg = "\n".join(lines)
-    # send in chunks to avoid message length limits
-    for chunk in [msg[i:i+1800] for i in range(0, len(msg), 1800)]:
-        await ctx.send(chunk)
-
-@admin.command(name="openthreads")
-@commands.has_permissions(administrator=True)
-async def admin_openthreads(ctx):
-    """Liste uniquement les posts ouverts (non fermés ET non archivés)."""
-    guild = ctx.guild
-    open_threads = []
-
-    for channel in guild.channels:
-        if isinstance(channel, discord.ForumChannel):
-            try:
-                # Threads actifs dans le cache
-                for t in channel.threads:
-                    if not getattr(t, 'locked', False) and not getattr(t, 'archived', False):
-                        if not getattr(t, 'parent', None):
-                            t.parent = channel
-                        open_threads.append(t)
-            except Exception as e:
-                await ctx.send(f"⚠️ Erreur forum {channel.name}: {e}")
-                continue
-
-    if not open_threads:
-        return await ctx.send("🔓 Aucun post ouvert trouvé sur ce serveur.")
-
-    # Tri par date
-    open_threads.sort(key=lambda t: t.created_at or 0)
-
-    # Message
-    lines = [f"🔓 Posts ouverts ({len(open_threads)}):"]
-    for t in open_threads:
-        created = t.created_at.strftime('%d/%m/%Y %H:%M') if t.created_at else '?'
-        forum_name = getattr(t.parent, 'name', 'unknown')
-        lines.append(f"• {t.name} — id:{t.id} — forum:{forum_name} — créé:{created}")
-
-    msg = "\n".join(lines)
-    for chunk in [msg[i:i+1800] for i in range(0, len(msg), 1800)]:
-        await ctx.send(chunk)
-
-async def check_old_closed_threads():
-    """Parcourt tous les threads fermés mais non archivés pour planifier leur archivage."""
-    print("🔍 Vérification des anciens posts fermés...")
-    now = datetime.now(timezone.utc)
-
-    for guild in bot.guilds:
-        for channel in guild.channels:
-            # On ne s’intéresse qu’aux forums
-            if isinstance(channel, discord.ForumChannel):
-                try:
-                    threads = channel.threads
-                    if not threads:
-                        continue
-
-                    for thread in threads:
-                        # Ignorer ceux déjà archivés
-                        if thread.archived:
-                            continue
-
-                        # Si fermé, planifier l’archivage
-                        if thread.locked:
-                            # Discord ne donne pas directement la date de fermeture, donc on suppose "fermé récemment"
-                            print(f"🧵 Thread fermé détecté : {thread.name}")
-                            await thread.send("📦 Ce post est déjà fermé — il sera archivé automatiquement dans 24 heures.")
-                            await asyncio.create_task(schedule_archive(thread))
-                except Exception as e:
-                    print(f"⚠️ Erreur lors de la vérification du forum {channel.name}: {e}")
-
-async def schedule_archive(thread: discord.Thread):
-    """Programme l’archivage d’un thread 24h après sa fermeture."""
-    try:
-        await asyncio.sleep(86400)  # 24 heures
-        refreshed = await thread.guild.fetch_channel(thread.id)
-        if not refreshed.archived:
-            await refreshed.edit(archived=True)
-            await refreshed.send("📦 Ce post a été **archivé automatiquement** après 24 heures.")
-            print(f"✅ Post '{refreshed.name}' archivé automatiquement après 24h.")
-    except Exception as e:
-        print(f"⚠️ Erreur dans schedule_archive : {e}")
 
 @bot.command(name="close")
 async def close_thread(ctx):
