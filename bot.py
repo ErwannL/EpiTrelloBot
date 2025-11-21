@@ -335,6 +335,37 @@ def get_reminder_channel(guild: discord.Guild, event):
 
     return None
 
+
+def _chunks_from_lines(msg: str, max_len: int = 1800):
+    """Split `msg` into chunks no longer than `max_len`, but only at line boundaries.
+
+    This prevents cutting a logical line (or sentence) in the middle when sending
+    long Discord messages.
+    """
+    if not msg:
+        return []
+    lines = msg.splitlines(keepends=True)
+    chunks = []
+    cur = []
+    cur_len = 0
+    for line in lines:
+        # If adding this line would overflow, flush current chunk first
+        if cur_len + len(line) > max_len:
+            if cur:
+                chunks.append(''.join(cur))
+                cur = []
+                cur_len = 0
+            # If single line is longer than max_len, put it alone in a chunk
+            if len(line) > max_len:
+                chunks.append(line)
+                continue
+        cur.append(line)
+        cur_len += len(line)
+
+    if cur:
+        chunks.append(''.join(cur))
+    return chunks
+
 async def fetch_all_threads(channel: discord.ForumChannel):
     """Récupère tous les threads d'un ForumChannel.
 
@@ -1257,11 +1288,21 @@ async def admin_debugthreads(ctx):
         lock_date = await get_lock_date(t.id, ctx.guild)
         locked = lock_date.strftime('%d/%m/%Y %H:%M') if lock_date else '—'
 
-        lines.append(f"• {t.name} — id:{t.id} — créé:{created} — fermé:{locked}")
+        # Date programmée de suppression = date de fermeture + 1 semaine
+        scheduled_deletion = None
+        if lock_date:
+            try:
+                scheduled_deletion = lock_date + timedelta(weeks=1)
+            except Exception:
+                scheduled_deletion = None
+
+        scheduled_str = scheduled_deletion.strftime('%d/%m/%Y %H:%M') if scheduled_deletion else '—'
+
+        lines.append(f"• {t.name} — id:{t.id} — créé:{created} — fermé:{locked} — suppression prévue:{scheduled_str}")
 
     msg = "\n".join(lines)
-    # send in chunks to avoid message length limits
-    for chunk in [msg[i:i+1800] for i in range(0, len(msg), 1800)]:
+    # send in chunks to avoid message length limits — split only at line boundaries
+    for chunk in _chunks_from_lines(msg):
         await ctx.send(chunk)
 
 
@@ -1298,7 +1339,7 @@ async def admin_openthreads(ctx):
         lines.append(f"• {t.name} — id:{t.id} — créé:{created}")
 
     msg = "\n".join(lines)
-    for chunk in [msg[i:i+1800] for i in range(0, len(msg), 1800)]:
+    for chunk in _chunks_from_lines(msg):
         await ctx.send(chunk)
 
 @admin.command(name="listthreads")
