@@ -39,6 +39,10 @@ notify_opt_out = set()
 # Mapping guild_id -> channel_id for forced reminder channel per guild
 reminder_channels = {}
 
+closing_cache = {}
+closed_threads = {}
+bot_closed_threads = set()  # IDs of threads closed by the bot command (temporary)
+
 # =========== 💾 GESTION FICHIERS ============
 
 # Load reminder channel overrides from disk
@@ -99,9 +103,87 @@ def save_notified_users():
         print(f"⚠️ Impossible d'enregistrer notified_users.json: {e}")
 
 
+# Load/save for closed threads (stores closure timestamp in ISO format)
+def load_closed_threads():
+    global closed_threads, closing_cache
+    path = os.path.join(os.getcwd(), 'closed_threads.json')
+    if not os.path.exists(path):
+        closed_threads = {}
+        return
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                closed_threads = data
+            else:
+                closed_threads = {}
+    except Exception:
+        closed_threads = {}
+
+    # seed closing_cache with parsed datetimes where possible
+    for k, v in list(closed_threads.items()):
+        try:
+            tid = int(k)
+            dt = None
+            if isinstance(v, str):
+                try:
+                    dt = datetime.fromisoformat(v)
+                except Exception:
+                    dt = None
+            closing_cache[tid] = dt
+        except Exception:
+            # skip entries that can't be parsed
+            pass
+
+def save_closed_threads():
+    path = os.path.join(os.getcwd(), 'closed_threads.json')
+    try:
+        with open(path, 'w') as f:
+            json.dump(closed_threads, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Impossible d'enregistrer closed_threads.json: {e}")
+
+
+async def send_confirmation_outside_thread(ctx, thread, content):
+    """Try to send a confirmation message outside the thread to avoid unarchiving it.
+
+    Order: DM the command author, then guild.system_channel (if available and sendable),
+    then send in the invoking channel only if it's not the thread.
+    Returns True if a message was sent, False otherwise.
+    """
+    # 1) DM the author
+    try:
+        await ctx.author.send(content)
+        return True
+    except Exception:
+        pass
+
+    # 2) system channel
+    try:
+        sc = ctx.guild.system_channel
+        if sc and getattr(sc, 'send', None):
+            perms = sc.permissions_for(ctx.guild.me)
+            if perms and perms.send_messages and sc != thread:
+                await sc.send(content)
+                return True
+    except Exception:
+        pass
+
+    # 3) if the invoking channel is different from the thread, send there
+    try:
+        if ctx.channel and getattr(ctx.channel, 'id', None) != getattr(thread, 'id', None):
+            await ctx.send(content)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 # Charger les opt-out en mémoire maintenant
 load_notified_users()
 load_reminder_channels()
+load_closed_threads()
 
 # ============ ⚙️ FONCTIONS UTILES ============
 
@@ -401,14 +483,42 @@ async def fetch_all_threads(channel: discord.ForumChannel):
     return list(unique.values())
 
 
+async def get_lock_date(thread_id: int, guild: discord.Guild):
+    # Vérifier cache
+    if thread_id in closing_cache:
+        return closing_cache[thread_id]
+
+    lock_date = None
+    try:
+        async for entry in guild.audit_logs(
+            limit=100,  # tu peux augmenter
+            action=discord.AuditLogAction.thread_update
+        ):
+            if entry.target.id != thread_id:
+                continue
+
+            before_locked = getattr(entry.before, "locked", None)
+            after_locked = getattr(entry.after, "locked", None)
+            if before_locked is False and after_locked is True:
+                lock_date = entry.created_at
+                break
+    except discord.Forbidden:
+        print(f"[DEBUG-LOCK] Pas de permission pour lire audit_logs")
+    except Exception as e:
+        print(f"[DEBUG-LOCK] Erreur inattendue: {e}")
+
+    closing_cache[thread_id] = lock_date
+    return lock_date
+
+
 # ============ 🚀 ÉVÉNEMENTS ============
 
 @bot.event
 async def on_ready():
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[RELOAD] {now} — ✅ Connecté en tant que {bot.user}")
-    check_meetings.start()
-    await check_old_closed_threads()
+    # check_meetings.start()
+    # await check_old_closed_threads()
 
 
 @bot.event
@@ -1142,13 +1252,18 @@ async def admin_debugthreads(ctx):
     lines.append(f"🧵 Fermés ({len(closed_threads)}):")
     for t in closed_threads:
         created = t.created_at.strftime('%d/%m/%Y %H:%M') if getattr(t, 'created_at', None) else '?'
-        # Format: name — id — créé (no forum part)
-        lines.append(f"• {t.name} — id:{t.id} — créé:{created}")
+
+        # Passe juste l'id, pas l'objet
+        lock_date = await get_lock_date(t.id, ctx.guild)
+        locked = lock_date.strftime('%d/%m/%Y %H:%M') if lock_date else '—'
+
+        lines.append(f"• {t.name} — id:{t.id} — créé:{created} — fermé:{locked}")
 
     msg = "\n".join(lines)
     # send in chunks to avoid message length limits
     for chunk in [msg[i:i+1800] for i in range(0, len(msg), 1800)]:
         await ctx.send(chunk)
+
 
 @admin.command(name="openthreads")
 @commands.has_permissions(administrator=True)
@@ -1180,8 +1295,7 @@ async def admin_openthreads(ctx):
     lines = [f"🔓 Posts ouverts ({len(open_threads)}):"]
     for t in open_threads:
         created = t.created_at.strftime('%d/%m/%Y %H:%M') if t.created_at else '?'
-        forum_name = getattr(t.parent, 'name', 'unknown')
-        lines.append(f"• {t.name} — id:{t.id} — forum:{forum_name} — créé:{created}")
+        lines.append(f"• {t.name} — id:{t.id} — créé:{created}")
 
     msg = "\n".join(lines)
     for chunk in [msg[i:i+1800] for i in range(0, len(msg), 1800)]:
@@ -1196,194 +1310,306 @@ async def admin_listthreads(ctx):
     await admin_openthreads(ctx)
     await admin_debugthreads(ctx)
 
+@bot.command(name="close")
+async def close_thread(ctx, post_id: int = None):
+    """Ferme (archive) un post de forum.
+
+    Usage:
+      - `!close` (dans un post) — archive le post courant
+      - `!close <post_id>` (admin) — archive le post avec l'ID fourni
+    """
+    thread = None
+
+    # If an ID is provided, search all forum channels for that thread
+    if post_id is not None:
+        for channel in ctx.guild.channels:
+            if isinstance(channel, discord.ForumChannel):
+                try:
+                    for t in channel.threads:
+                        if t.id == post_id:
+                            thread = t
+                            break
+                except Exception:
+                    continue
+            if thread:
+                break
+
+        if not thread:
+            await ctx.send(f"❌ Post {post_id} introuvable.")
+            return
+    else:
+        # No ID: must be used inside a thread
+        if isinstance(ctx.channel, discord.Thread):
+            thread = ctx.channel
+        else:
+            await ctx.send("⚠️ Cette commande doit être utilisée dans un post de forum ou avec un ID : `!close <post_id>`.")
+            return
+
+    # If already archived, inform and return
+    try:
+        if getattr(thread, 'archived', False):
+            await ctx.send(f"ℹ️ Le post {thread.id} est déjà archivé.")
+            return
+    except Exception:
+        pass
+
+    # Permission check: Manage Threads is required to archive
+    perms = None
+    try:
+        perms = thread.permissions_for(ctx.guild.me)
+    except Exception:
+        perms = None
+
+    if perms is not None and not getattr(perms, 'manage_threads', False):
+        await ctx.send("❌ Je n'ai pas la permission `Manage Threads` pour archiver ce post. Vérifie mes permissions.")
+        return
+
+    # Attempt to archive using the library, then verify. If it doesn't take effect, try REST fallback.
+    try:
+        await thread.edit(archived=True)
+
+        # verify by fetching fresh channel object
+        try:
+            refreshed = await thread.guild.fetch_channel(thread.id)
+            archived_now = getattr(refreshed, 'archived', False)
+        except Exception:
+            refreshed = None
+            archived_now = None
+
+        # If the library call didn't actually archive, try REST fallback (requires BOT token)
+        if not archived_now:
+            fallback_ok = False
+            if TOKEN:
+                try:
+                    url = f"https://discord.com/api/v10/channels/{thread.id}"
+                    headers = {"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"}
+                    payload = {"archived": True}
+                    resp = requests.patch(url, headers=headers, json=payload, timeout=10)
+                    if resp.status_code in (200, 201):
+                        fallback_ok = True
+                    else:
+                        logger.warning(f"REST fallback archive failed for {thread.id}: {resp.status_code} {resp.text}")
+                except Exception as e:
+                    logger.warning(f"REST fallback archive exception for {thread.id}: {e}")
+
+            # re-fetch to confirm
+            try:
+                refreshed = await thread.guild.fetch_channel(thread.id)
+                archived_now = getattr(refreshed, 'archived', False)
+            except Exception:
+                archived_now = False
+
+        if archived_now:
+            now_dt = datetime.now(timezone.utc)
+            try:
+                closed_threads[str(thread.id)] = now_dt.isoformat()
+                closing_cache[thread.id] = now_dt
+                save_closed_threads()
+            except Exception as _e:
+                logger.warning(f"Impossible d'enregistrer la fermeture du thread {thread.id}: {_e}")
+
+            # Notify the user outside of the (now archived) thread to avoid unarchiving it
+            msg = f"✅ Post {thread.id} archivé (clos) avec succès."
+            sent = await send_confirmation_outside_thread(ctx, thread, msg)
+            if not sent:
+                # last fallback: log if we couldn't send anywhere
+                logger.info(msg)
+            print(f"🧵 Post '{thread.name}' ({thread.id}) archivé manuellement par {ctx.author}.")
+            return
+
+        # If we reach here, archive did not succeed
+        await ctx.send("❌ Tentative d'archivage effectuée mais le post reste ouvert. Vérifie mes permissions et le type de thread (public/private).")
+        logger.warning(f"Archive reported success but channel {thread.id} not archived (checked properties).")
+
+    except discord.Forbidden:
+        await ctx.send("❌ Je n'ai pas la permission d'archiver ce post. Vérifie `Manage Threads` et les permissions de canal.")
+    except Exception as e:
+        await ctx.send(f"❌ Erreur lors de l'archivage: {e}")
+
 
 # ========== To fix ===========
 
-async def check_old_closed_threads():
-    """Parcourt tous les threads fermés mais non archivés pour planifier leur archivage."""
-    print("🔍 Vérification des anciens posts fermés...")
-    now = datetime.now(timezone.utc)
+# async def check_old_closed_threads():
+#     """Parcourt tous les threads fermés mais non archivés pour planifier leur archivage."""
+#     print("🔍 Vérification des anciens posts fermés...")
+#     now = datetime.now(timezone.utc)
 
-    for guild in bot.guilds:
-        for channel in guild.channels:
-            # On ne s’intéresse qu’aux forums
-            if isinstance(channel, discord.ForumChannel):
-                try:
-                    threads = channel.threads
-                    if not threads:
-                        continue
+#     for guild in bot.guilds:
+#         for channel in guild.channels:
+#             # On ne s’intéresse qu’aux forums
+#             if isinstance(channel, discord.ForumChannel):
+#                 try:
+#                     threads = channel.threads
+#                     if not threads:
+#                         continue
 
-                    for thread in threads:
-                        # Ignorer ceux déjà archivés
-                        if thread.archived:
-                            continue
+#                     for thread in threads:
+#                         # Ignorer ceux déjà archivés
+#                         if thread.archived:
+#                             continue
 
-                        # Si fermé, planifier l’archivage
-                        if thread.locked:
-                            # Discord ne donne pas directement la date de fermeture, donc on suppose "fermé récemment"
-                            print(f"🧵 Thread fermé détecté : {thread.name}")
-                            await thread.send("📦 Ce post est déjà fermé — il sera archivé automatiquement dans 24 heures.")
-                            await asyncio.create_task(schedule_archive(thread))
-                except Exception as e:
-                    print(f"⚠️ Erreur lors de la vérification du forum {channel.name}: {e}")
+#                         # Si fermé, planifier l’archivage
+#                         if thread.locked:
+#                             # Discord ne donne pas directement la date de fermeture, donc on suppose "fermé récemment"
+#                             print(f"🧵 Thread fermé détecté : {thread.name}")
+#                             await thread.send("📦 Ce post est déjà fermé — il sera archivé automatiquement dans 24 heures.")
+#                             await asyncio.create_task(schedule_archive(thread))
+#                 except Exception as e:
+#                     print(f"⚠️ Erreur lors de la vérification du forum {channel.name}: {e}")
 
-async def schedule_archive(thread: discord.Thread):
-    """Programme l’archivage d’un thread 24h après sa fermeture."""
-    try:
-        await asyncio.sleep(86400)  # 24 heures
-        refreshed = await thread.guild.fetch_channel(thread.id)
-        if not refreshed.archived:
-            await refreshed.edit(archived=True)
-            await refreshed.send("📦 Ce post a été **archivé automatiquement** après 24 heures.")
-            print(f"✅ Post '{refreshed.name}' archivé automatiquement après 24h.")
-    except Exception as e:
-        print(f"⚠️ Erreur dans schedule_archive : {e}")
+# async def schedule_archive(thread: discord.Thread):
+#     """Programme l’archivage d’un thread 24h après sa fermeture.
 
-
-@tasks.loop(minutes=1)
-async def check_meetings():
-    """Vérifie les événements Discord planifiés et envoie un rappel 5 min avant aux intéressés non connectés"""
-    now = datetime.now(timezone.utc)
-    for guild in bot.guilds:
-        events = await guild.fetch_scheduled_events()
-        for event in events:
-            # Inspect event and compute start delta
-            start_time = get_event_start_time(event)
-            logger.debug(f"Checking event {getattr(event,'name','N/A')} (id={getattr(event,'id','N/A')}), status={getattr(event,'status','N/A')}, start_time={start_time}")
-            if event.status != discord.EventStatus.scheduled:
-                logger.debug(f"Skipping event {getattr(event,'id','N/A')} because status != scheduled ({getattr(event,'status','N/A')})")
-                continue
-            if start_time is None:
-                logger.debug(f"Skipping event {getattr(event,'id','N/A')} because start_time is None")
-                continue
-            delta = (start_time - now).total_seconds()
-            logger.debug(f"Event delta (seconds) for {getattr(event,'id','N/A')}: {delta}")
-
-            # Si l’événement commence dans 5 minutes ou moins
-            if 0 < delta <= 300:
-                # Resolve the reminder channel (may use per-guild override)
-                channel = get_reminder_channel(guild, event)
-                if not channel or not hasattr(channel, 'send'):
-                    logger.error(f"⚠️ Aucun channel textuel disponible pour envoyer le rappel de {getattr(event,'name','N/A')} (guild {guild.id}).")
-                    continue
-
-                # 🔹 Étape 1 — Récupérer les personnes intéressées (compatibilité versions discord.py)
-                interested_users = await get_event_interested_users(guild, event)
-                logger.debug(f"Retrieved {len(interested_users) if interested_users is not None else 0} interested users for event {getattr(event,'id','N/A')}")
-
-                # 🔹 Étape 2 — Identifier qui est déjà dans le salon vocal
-                already_connected = []
-                if isinstance(event.channel, discord.VoiceChannel):
-                    already_connected = [m for m in event.channel.members]
-
-                # 🔹 Étape 3 — Filtrer pour ne pinguer que ceux pas encore connectés et qui veulent des notifications
-                users_to_ping = [
-                    u.mention for u in interested_users
-                    if getattr(u, 'id', None) not in notify_opt_out and all(getattr(u,'id', None) != m.id for m in already_connected)
-                ]
-
-                if not users_to_ping:
-                    logger.info(f"Personne à ping pour {getattr(event,'name','N/A')} (tous déjà connectés ou opt-out 👏)")
-                    continue
-
-                mentions = ", ".join(users_to_ping)
-
-                embed = discord.Embed(
-                    title=f"⏰ Rappel : {event.name}",
-                    description=f"L’événement commence dans **5 minutes** !\n\n🔔 Participants à prévenir : {mentions}",
-                    color=0x5865F2,
-                    timestamp=start_time
-                )
-                # Indiquer dans le footer le channel ciblé (sera utile pour retrouver le message)
-                target_channel_name = None
-                if channel is not None:
-                    target_channel_name = getattr(channel, 'name', None) or str(getattr(channel, 'id', 'N/A'))
-                footer_text = f"Heure locale selon le fuseau horaire Discord de chacun. | channel: {target_channel_name or 'unknown'}"
-                embed.set_footer(text=footer_text)
-
-                try:
-                    # First send plain mentions to trigger pings
-                    allowed_ping = discord.AllowedMentions(users=True)
-                    try:
-                        await channel.send(mentions, allowed_mentions=allowed_ping)
-                    except Exception:
-                        logger.warning(f"Envoi du contenu de mentions échoué pour {event.name} dans {getattr(channel,'name', getattr(channel,'id','N/A'))}")
-
-                    # Then send the embed without mentions to avoid double pings
-                    try:
-                        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-                    except Exception as e:
-                        logger.error(f"Erreur envoi embed rappel pour {event.name} dans {getattr(channel,'name', getattr(channel,'id','N/A'))}: {e}")
-                        raise
-
-                    ch_desc = getattr(channel, 'name', None) or getattr(channel, 'id', 'N/A')
-                    logger.info(f"🔔 Rappel envoyé pour {event.name} (ping de {len(users_to_ping)} membres) dans channel '{ch_desc}'")
-                except Exception as e:
-                    ch_desc = getattr(channel, 'name', None) or getattr(channel, 'id', 'N/A')
-                    logger.error(f"⚠️ Échec envoi du rappel pour {event.name} dans channel '{ch_desc}': {e}")
-                    # try to fallback to system channel if available and different
-                    try:
-                        if guild.system_channel and getattr(guild.system_channel, 'send', None) and guild.system_channel != channel:
-                            allowed_ping = discord.AllowedMentions(users=True)
-                            try:
-                                await guild.system_channel.send(mentions, allowed_mentions=allowed_ping)
-                            except Exception:
-                                logger.warning(f"Envoi du contenu de mentions échoué pour {event.name} dans system_channel")
-                            await guild.system_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-                            sys_desc = getattr(guild.system_channel, 'name', None) or getattr(guild.system_channel, 'id', 'N/A')
-                            logger.info(f"🔔 Rappel envoyé pour {event.name} dans system_channel '{sys_desc}'")
-                    except Exception as e2:
-                        logger.error(f"⚠️ Échec envoi du rappel fallback pour {event.name}: {e2}")
-
-                # Évite le spam toutes les minutes
-                await asyncio.sleep(65)
-
-@bot.event
-async def on_thread_update(before: discord.Thread, after: discord.Thread):
-    """Détecte quand un post est fermé puis l’archive 24h plus tard."""
-    try:
-        # Vérifie que le thread vient d’être fermé
-        if before.locked is False and after.locked is True:
-            print(f"🧵 Le post '{after.name}' a été fermé. Archivage prévu dans 24h.")
-            await after.send("🔒 Ce post a été **fermé**. Il sera archivé automatiquement dans 24 heures.")
-            await asyncio.sleep(86400)  # 24 heures
-            # Vérifie que le post n’a pas été rouvert entre temps
-            refreshed = await after.guild.fetch_channel(after.id)
-            if not refreshed.archived:
-                await refreshed.edit(archived=True)
-                await refreshed.send("📦 Ce post a été **archivé automatiquement** après 24 heures.")
-                print(f"✅ Post '{after.name}' archivé automatiquement après 24h.")
-    except Exception as e:
-        print(f"⚠️ Erreur lors de l’archivage automatique du post : {e}")
+#     Cette fonction est utilisée comme fallback si l'archivage immédiat échoue
+#     (permissions manquantes ou autre)."""
+#     try:
+#         await asyncio.sleep(86400)  # 24 heures
+#         refreshed = await thread.guild.fetch_channel(thread.id)
+#         if not getattr(refreshed, 'archived', False):
+#             try:
+#                 await refreshed.edit(archived=True)
+#                 # Notify in system_channel if possible (avoid sending inside archived thread)
+#                 try:
+#                     sc = refreshed.guild.system_channel
+#                     if sc and getattr(sc, 'send', None):
+#                         perms = sc.permissions_for(refreshed.guild.me)
+#                         if perms and perms.send_messages:
+#                             await sc.send(f"📦 Le post '{refreshed.name}' ({thread.id}) a été archivé automatiquement.")
+#                 except Exception:
+#                     pass
+#             except Exception as e:
+#                 print(f"⚠️ Erreur lors de l'archivage programmé du post {thread.id}: {e}")
+#             else:
+#                 print(f"✅ Post '{refreshed.name}' archivé automatiquement après 24h.")
+#     except Exception as e:
+#         print(f"⚠️ Erreur dans schedule_archive : {e}")
 
 
-@bot.command(name="close")
-async def close_thread(ctx):
-    """Ferme le post/forum actuel et programme son archivage automatique dans 24h."""
-    thread = ctx.channel
+# @tasks.loop(minutes=1)
+# async def check_meetings():
+#     """Vérifie les événements Discord planifiés et envoie un rappel 5 min avant aux intéressés non connectés"""
+#     now = datetime.now(timezone.utc)
+#     for guild in bot.guilds:
+#         events = await guild.fetch_scheduled_events()
+#         for event in events:
+#             # Inspect event and compute start delta
+#             start_time = get_event_start_time(event)
+#             logger.debug(f"Checking event {getattr(event,'name','N/A')} (id={getattr(event,'id','N/A')}), status={getattr(event,'status','N/A')}, start_time={start_time}")
+#             if event.status != discord.EventStatus.scheduled:
+#                 logger.debug(f"Skipping event {getattr(event,'id','N/A')} because status != scheduled ({getattr(event,'status','N/A')})")
+#                 continue
+#             if start_time is None:
+#                 logger.debug(f"Skipping event {getattr(event,'id','N/A')} because start_time is None")
+#                 continue
+#             delta = (start_time - now).total_seconds()
+#             logger.debug(f"Event delta (seconds) for {getattr(event,'id','N/A')}: {delta}")
 
-    if not isinstance(thread, discord.Thread):
-        await ctx.send("⚠️ Cette commande ne peut être utilisée **que dans un post de forum**.")
-        return
+#             # Si l’événement commence dans 5 minutes ou moins
+#             if 0 < delta <= 300:
+#                 # Resolve the reminder channel (may use per-guild override)
+#                 channel = get_reminder_channel(guild, event)
+#                 if not channel or not hasattr(channel, 'send'):
+#                     logger.error(f"⚠️ Aucun channel textuel disponible pour envoyer le rappel de {getattr(event,'name','N/A')} (guild {guild.id}).")
+#                     continue
 
-    # Vérifie si le thread est déjà fermé
-    if thread.locked:
-        await ctx.send("🔒 Ce post est **déjà fermé**.")
-        return
+#                 # 🔹 Étape 1 — Récupérer les personnes intéressées (compatibilité versions discord.py)
+#                 interested_users = await get_event_interested_users(guild, event)
+#                 logger.debug(f"Retrieved {len(interested_users) if interested_users is not None else 0} interested users for event {getattr(event,'id','N/A')}")
 
-    try:
-        await thread.edit(locked=True)
-        await ctx.send("✅ Ce post a été **fermé**. Il sera archivé automatiquement dans 24 heures.")
-        print(f"🧵 Post '{thread.name}' fermé manuellement par {ctx.author}. Archivage dans 24h.")
-        await asyncio.sleep(86400)
-        refreshed = await thread.guild.fetch_channel(thread.id)
-        if not refreshed.archived:
-            await refreshed.edit(archived=True)
-            await refreshed.send("📦 Ce post a été **archivé automatiquement** après 24 heures.")
-            print(f"✅ Post '{thread.name}' archivé automatiquement après 24h.")
-    except Exception as e:
-        await ctx.send("⚠️ Impossible de fermer ou archiver ce post.")
-        print(f"Erreur lors de la fermeture manuelle du post : {e}")
+#                 # 🔹 Étape 2 — Identifier qui est déjà dans le salon vocal
+#                 already_connected = []
+#                 if isinstance(event.channel, discord.VoiceChannel):
+#                     already_connected = [m for m in event.channel.members]
+
+#                 # 🔹 Étape 3 — Filtrer pour ne pinguer que ceux pas encore connectés et qui veulent des notifications
+#                 users_to_ping = [
+#                     u.mention for u in interested_users
+#                     if getattr(u, 'id', None) not in notify_opt_out and all(getattr(u,'id', None) != m.id for m in already_connected)
+#                 ]
+
+#                 if not users_to_ping:
+#                     logger.info(f"Personne à ping pour {getattr(event,'name','N/A')} (tous déjà connectés ou opt-out 👏)")
+#                     continue
+
+#                 mentions = ", ".join(users_to_ping)
+
+#                 embed = discord.Embed(
+#                     title=f"⏰ Rappel : {event.name}",
+#                     description=f"L’événement commence dans **5 minutes** !\n\n🔔 Participants à prévenir : {mentions}",
+#                     color=0x5865F2,
+#                     timestamp=start_time
+#                 )
+#                 # Indiquer dans le footer le channel ciblé (sera utile pour retrouver le message)
+#                 target_channel_name = None
+#                 if channel is not None:
+#                     target_channel_name = getattr(channel, 'name', None) or str(getattr(channel, 'id', 'N/A'))
+#                 footer_text = f"Heure locale selon le fuseau horaire Discord de chacun. | channel: {target_channel_name or 'unknown'}"
+#                 embed.set_footer(text=footer_text)
+
+#                 try:
+#                     # First send plain mentions to trigger pings
+#                     allowed_ping = discord.AllowedMentions(users=True)
+#                     try:
+#                         await channel.send(mentions, allowed_mentions=allowed_ping)
+#                     except Exception:
+#                         logger.warning(f"Envoi du contenu de mentions échoué pour {event.name} dans {getattr(channel,'name', getattr(channel,'id','N/A'))}")
+
+#                     # Then send the embed without mentions to avoid double pings
+#                     try:
+#                         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+#                     except Exception as e:
+#                         logger.error(f"Erreur envoi embed rappel pour {event.name} dans {getattr(channel,'name', getattr(channel,'id','N/A'))}: {e}")
+#                         raise
+
+#                     ch_desc = getattr(channel, 'name', None) or getattr(channel, 'id', 'N/A')
+#                     logger.info(f"🔔 Rappel envoyé pour {event.name} (ping de {len(users_to_ping)} membres) dans channel '{ch_desc}'")
+#                 except Exception as e:
+#                     ch_desc = getattr(channel, 'name', None) or getattr(channel, 'id', 'N/A')
+#                     logger.error(f"⚠️ Échec envoi du rappel pour {event.name} dans channel '{ch_desc}': {e}")
+#                     # try to fallback to system channel if available and different
+#                     try:
+#                         if guild.system_channel and getattr(guild.system_channel, 'send', None) and guild.system_channel != channel:
+#                             allowed_ping = discord.AllowedMentions(users=True)
+#                             try:
+#                                 await guild.system_channel.send(mentions, allowed_mentions=allowed_ping)
+#                             except Exception:
+#                                 logger.warning(f"Envoi du contenu de mentions échoué pour {event.name} dans system_channel")
+#                             await guild.system_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+#                             sys_desc = getattr(guild.system_channel, 'name', None) or getattr(guild.system_channel, 'id', 'N/A')
+#                             logger.info(f"🔔 Rappel envoyé pour {event.name} dans system_channel '{sys_desc}'")
+#                     except Exception as e2:
+#                         logger.error(f"⚠️ Échec envoi du rappel fallback pour {event.name}: {e2}")
+
+#                 # Évite le spam toutes les minutes
+#                 await asyncio.sleep(65)
+
+# @bot.event
+# async def on_thread_update(before: discord.Thread, after: discord.Thread):
+#     """Détecte quand un post est fermé puis l’archive 24h plus tard."""
+#     try:
+#         # Vérifie que le thread vient d’être fermé
+#         if before.locked is False and after.locked is True:
+#             # If the bot itself just closed this thread via the `!close` command,
+#             # avoid sending a duplicate message here. The command already notifies.
+#             if getattr(after, 'id', None) in bot_closed_threads:
+#                 try:
+#                     bot_closed_threads.discard(after.id)
+#                 except Exception:
+#                     pass
+#                 return
+
+#             print(f"🧵 Le post '{after.name}' a été fermé. Archivage prévu dans 24h.")
+#             await after.send("🔒 Ce post a été **fermé**. Il sera archivé automatiquement dans 24 heures.")
+#             await asyncio.sleep(86400)  # 24 heures
+#             # Vérifie que le post n’a pas été rouvert entre temps
+#             refreshed = await after.guild.fetch_channel(after.id)
+#             if not refreshed.archived:
+#                 await refreshed.edit(archived=True)
+#                 await refreshed.send("📦 Ce post a été **archivé automatiquement** après 24 heures.")
+#                 print(f"✅ Post '{after.name}' archivé automatiquement après 24h.")
+#     except Exception as e:
+#         print(f"⚠️ Erreur lors de l’archivage automatique du post : {e}")
+
 
 # ============ LANCEMENT DU BOT ============
 
