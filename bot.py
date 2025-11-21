@@ -542,12 +542,115 @@ async def get_lock_date(thread_id: int, guild: discord.Guild):
     return lock_date
 
 
+# ---- Background task: purge closed threads older than 1 week ----
+@tasks.loop(minutes=60)
+async def purge_closed_threads():
+    """Delete threads listed in `closed_threads` if they were closed more than 1 week ago.
+
+    Runs periodically and removes successful/irrecoverable entries from `closed_threads.json`.
+    """
+    now = datetime.now(timezone.utc)
+    to_delete = []
+
+    # Collect candidate thread IDs
+    for tid_str, iso in list(closed_threads.items()):
+        try:
+            tid = int(tid_str)
+        except Exception:
+            continue
+
+        dt = None
+        # Prefer cached parsed datetime
+        if tid in closing_cache and closing_cache[tid] is not None:
+            dt = closing_cache[tid]
+        else:
+            if isinstance(iso, str):
+                try:
+                    dt = datetime.fromisoformat(iso)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    dt = None
+
+        if not dt:
+            # can't determine close date; skip for now
+            continue
+
+        if now >= dt + timedelta(weeks=1):
+            to_delete.append((tid, dt))
+
+    # Attempt deletion
+    for tid, dt in to_delete:
+        ch = bot.get_channel(tid)
+        if ch is None:
+            # try fetch via bot (may fail if not available)
+            try:
+                ch = await bot.fetch_channel(tid)
+            except Exception:
+                ch = None
+
+        # fallback: try per-guild fetch
+        if ch is None:
+            for g in bot.guilds:
+                try:
+                    ch = await g.fetch_channel(tid)
+                    if ch:
+                        break
+                except Exception:
+                    ch = None
+
+        if ch is None:
+            # channel not found anymore: remove from closed_threads
+            closed_threads.pop(str(tid), None)
+            closing_cache.pop(tid, None)
+            try:
+                save_closed_threads()
+            except Exception:
+                logger.warning(f"Auto-purge: couldn't save closed_threads after removing {tid}")
+            logger.info(f"Auto-purge: thread {tid} not found; removed from closed_threads.json")
+            continue
+
+        try:
+            await ch.delete(reason="Auto-deleted: closed > 1 week")
+        except Exception as e:
+            logger.warning(f"Auto-purge: failed to delete thread {tid}: {e}")
+            # don't remove the entry so we can retry later
+            continue
+
+        # deletion succeeded: remove record and persist
+        closed_threads.pop(str(tid), None)
+        closing_cache.pop(tid, None)
+        try:
+            save_closed_threads()
+        except Exception:
+            logger.warning(f"Auto-purge: couldn't save closed_threads after deleting {tid}")
+
+        logger.info(f"Auto-purge: deleted thread {tid} (closed at {dt.isoformat()})")
+
+        # Optional: notify guild.system_channel if available and sendable
+        try:
+            guild = getattr(ch, 'guild', None)
+            if guild and getattr(guild, 'system_channel', None):
+                sc = guild.system_channel
+                perms = sc.permissions_for(guild.me)
+                if perms and perms.send_messages:
+                    await sc.send(f"🗑️ Le post '{getattr(ch,'name', str(tid))}' a été supprimé automatiquement (fermé depuis plus d'une semaine).")
+        except Exception:
+            pass
+
+
 # ============ 🚀 ÉVÉNEMENTS ============
 
 @bot.event
 async def on_ready():
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[RELOAD] {now} — ✅ Connecté en tant que {bot.user}")
+    # Start periodic background tasks
+    try:
+        if not purge_closed_threads.is_running():
+            purge_closed_threads.start()
+    except Exception:
+        pass
     # check_meetings.start()
     # await check_old_closed_threads()
 
@@ -1470,62 +1573,6 @@ async def close_thread(ctx, post_id: int = None):
 
 # ========== To fix ===========
 
-# async def check_old_closed_threads():
-#     """Parcourt tous les threads fermés mais non archivés pour planifier leur archivage."""
-#     print("🔍 Vérification des anciens posts fermés...")
-#     now = datetime.now(timezone.utc)
-
-#     for guild in bot.guilds:
-#         for channel in guild.channels:
-#             # On ne s’intéresse qu’aux forums
-#             if isinstance(channel, discord.ForumChannel):
-#                 try:
-#                     threads = channel.threads
-#                     if not threads:
-#                         continue
-
-#                     for thread in threads:
-#                         # Ignorer ceux déjà archivés
-#                         if thread.archived:
-#                             continue
-
-#                         # Si fermé, planifier l’archivage
-#                         if thread.locked:
-#                             # Discord ne donne pas directement la date de fermeture, donc on suppose "fermé récemment"
-#                             print(f"🧵 Thread fermé détecté : {thread.name}")
-#                             await thread.send("📦 Ce post est déjà fermé — il sera archivé automatiquement dans 24 heures.")
-#                             await asyncio.create_task(schedule_archive(thread))
-#                 except Exception as e:
-#                     print(f"⚠️ Erreur lors de la vérification du forum {channel.name}: {e}")
-
-# async def schedule_archive(thread: discord.Thread):
-#     """Programme l’archivage d’un thread 24h après sa fermeture.
-
-#     Cette fonction est utilisée comme fallback si l'archivage immédiat échoue
-#     (permissions manquantes ou autre)."""
-#     try:
-#         await asyncio.sleep(86400)  # 24 heures
-#         refreshed = await thread.guild.fetch_channel(thread.id)
-#         if not getattr(refreshed, 'archived', False):
-#             try:
-#                 await refreshed.edit(archived=True)
-#                 # Notify in system_channel if possible (avoid sending inside archived thread)
-#                 try:
-#                     sc = refreshed.guild.system_channel
-#                     if sc and getattr(sc, 'send', None):
-#                         perms = sc.permissions_for(refreshed.guild.me)
-#                         if perms and perms.send_messages:
-#                             await sc.send(f"📦 Le post '{refreshed.name}' ({thread.id}) a été archivé automatiquement.")
-#                 except Exception:
-#                     pass
-#             except Exception as e:
-#                 print(f"⚠️ Erreur lors de l'archivage programmé du post {thread.id}: {e}")
-#             else:
-#                 print(f"✅ Post '{refreshed.name}' archivé automatiquement après 24h.")
-#     except Exception as e:
-#         print(f"⚠️ Erreur dans schedule_archive : {e}")
-
-
 # @tasks.loop(minutes=1)
 # async def check_meetings():
 #     """Vérifie les événements Discord planifiés et envoie un rappel 5 min avant aux intéressés non connectés"""
@@ -1623,33 +1670,6 @@ async def close_thread(ctx, post_id: int = None):
 
 #                 # Évite le spam toutes les minutes
 #                 await asyncio.sleep(65)
-
-# @bot.event
-# async def on_thread_update(before: discord.Thread, after: discord.Thread):
-#     """Détecte quand un post est fermé puis l’archive 24h plus tard."""
-#     try:
-#         # Vérifie que le thread vient d’être fermé
-#         if before.locked is False and after.locked is True:
-#             # If the bot itself just closed this thread via the `!close` command,
-#             # avoid sending a duplicate message here. The command already notifies.
-#             if getattr(after, 'id', None) in bot_closed_threads:
-#                 try:
-#                     bot_closed_threads.discard(after.id)
-#                 except Exception:
-#                     pass
-#                 return
-
-#             print(f"🧵 Le post '{after.name}' a été fermé. Archivage prévu dans 24h.")
-#             await after.send("🔒 Ce post a été **fermé**. Il sera archivé automatiquement dans 24 heures.")
-#             await asyncio.sleep(86400)  # 24 heures
-#             # Vérifie que le post n’a pas été rouvert entre temps
-#             refreshed = await after.guild.fetch_channel(after.id)
-#             if not refreshed.archived:
-#                 await refreshed.edit(archived=True)
-#                 await refreshed.send("📦 Ce post a été **archivé automatiquement** après 24 heures.")
-#                 print(f"✅ Post '{after.name}' archivé automatiquement après 24h.")
-#     except Exception as e:
-#         print(f"⚠️ Erreur lors de l’archivage automatique du post : {e}")
 
 
 # ============ LANCEMENT DU BOT ============
